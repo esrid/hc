@@ -1,22 +1,77 @@
 # HC Component Templates
 
-This repository shows how to build reusable HTML components on top of Go's `html/template`.  
-`main.go` is the minimal, beginner-friendly entry point—it wires everything together and renders `web/pages/page.gohtml`.
+This module lets you build composable HTML components on top of Go's `html/template`.  
+Install it in your own project, point it at a directory of component templates, and call `ParseFile` to render pages.
 
-## Quick Start
-
-```bash
-go run main.go
-```
-
-The command renders the sample page to standard output. Redirect it to a file if you want to open it in a browser:
+## Installation
 
 ```bash
-go run main.go > page.html
-open page.html
+go get github.com/esrid/hc
 ```
 
-## How It Works
+> The repository also ships a tiny demo under `main.go`, but you never need to run it in your project.
+
+## Set Up a Renderer
+
+Create a shared renderer as part of your application. This example embeds templates and exposes an HTTP handler, but the same renderer can be reused in CLI tools or background jobs:
+
+```go
+package renderer
+
+import (
+  "embed"
+  "html/template"
+  "net/http"
+  "strings"
+
+  "github.com/esrid/hc"
+)
+
+//go:embed web/**
+var templateFS embed.FS
+
+var components = hc.NewHC("web/components",
+  hc.WithFS(templateFS), // load from embed.FS
+  hc.WithFuncMap(template.FuncMap{
+    "upper": strings.ToUpper,
+  }),
+)
+
+func PageHandler(w http.ResponseWriter, r *http.Request) {
+  data := map[string]any{
+    "Primary": "save changes",
+    "Message": "Welcome back",
+  }
+  if err := components.ParseFile(w, "web/pages/page.gohtml", data); err != nil {
+    http.Error(w, err.Error(), http.StatusInternalServerError)
+  }
+}
+```
+
+- `NewHC(folder string, opts ...Option)` initialises the engine and memoizes compiled component templates keyed by lowercase component names. Reuse the same instance across requests; the cache is concurrency-safe.
+- `WithFS(embed.FS)` lets you serve templates out of `//go:embed` bundles. Without it, files are read from disk relative to `folder`.
+- `WithFuncMap(template.FuncMap)` merges additional helpers into both the component templates and attribute evaluator. Helpers can be consumed inside component files (`{{ upper .Props.text }}`) or attribute expressions (`text="{{ upper .Primary }}"`).
+- `ParseFile(writer io.Writer, filename string, data any) error` loads the top-level template, resolves every component in up to 16 passes, and writes the final markup to `writer`. Pass `nil` as the writer if you only need to check for errors (no buffer will be returned).
+
+Attribute values run through Go's `text/template` with the same func map, so props can reference fields from `data` or call helper functions. Inside component templates you have access to:
+
+- `.Props` and `.Attrs` for resolved attributes (`.Attrs` keeps original casing so `forwardAttrs` can re-emit them).
+- `.Children` for rendered nested markup (empty for self-closing components).
+- `.Ctx` for the entire data object passed to `ParseFile`.
+
+## Rendering Outside HTTP
+
+To generate HTML in scripts or tests, point the renderer at an `io.Writer` of your choice:
+
+```go
+var buf bytes.Buffer
+if err := components.ParseFile(&buf, "web/pages/page.gohtml", map[string]any{"Message": "Hi"}); err != nil {
+  t.Fatal(err)
+}
+got := buf.String()
+```
+
+## Template Conventions
 
 - Components live in `web/components/*.html`. The component name must start with an uppercase letter (for example `Button` → `web/components/button.html`).
 - Pages and partials can use components by writing a matching HTML-like tag: `<Button text="Save"/>`.
@@ -121,9 +176,9 @@ The renderer runs repeatedly (up to 16 passes) until every custom component is e
 If you need extra helpers, extend the func map in `main.go`:
 
 ```go
-hc := NewHC("web/components",
-  WithFS(content),
-  WithFuncMap(template.FuncMap{
+engine := hc.NewHC("web/components",
+  hc.WithFS(content),
+  hc.WithFuncMap(template.FuncMap{
     "upper": strings.ToUpper,
     "title": cases.Title(language.English).String,
   }),
@@ -139,3 +194,12 @@ Now attributes and templates can call `{{ title .Primary }}` just like any other
 - **Unclosed component tag** – ensure every `<Component>` has a corresponding `</Component>` unless it is self-closing (`<Component />`).
 
 With these patterns you can incrementally grow a library of HTML-building blocks while staying inside familiar Go templates. Explore `main.go` and `web/pages/page.gohtml` to see the complete, beginner-friendly example.
+
+## Optional: Run the Demo
+
+The repository includes a runnable sample you can inspect locally:
+
+```bash
+go run main.go > page.html
+open page.html
+```
