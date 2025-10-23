@@ -1,0 +1,5 @@
+{{- $label := "" -}}
+{{- with .Props.text -}}
+  {{- $label = . -}}
+{{- end -}}
+<button{{forwardAttrs .Attrs "text"}}>{{ $label }}</button>
