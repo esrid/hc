@@ -542,22 +542,3 @@ func toKebabCase(name string) string {
 func isSpaceByte(b byte) bool {
 	return b == ' ' || b == '\n' || b == '\r' || b == '\t'
 }
-
-//go:embed all:web
-var content embed.FS
-
-func main() {
-	hc := NewHC("web/components",
-		WithFS(content),
-		WithFuncMap(template.FuncMap{
-			"upper": strings.ToUpper,
-		}),
-	)
-
-	data := map[string]string{
-		"Message": "HI",
-	}
-	if err := hc.ParseFile(os.Stdout, "web/pages/page.gohtml", data); err != nil {
-		fmt.Fprintf(os.Stderr, "render page: %v\n", err)
-	}
-}
