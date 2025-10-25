@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	texttmpl "text/template"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -47,12 +48,51 @@ type componentSource struct {
 	source  string
 }
 
+type PostProcessor func(context.Context, []byte, any, template.FuncMap) ([]byte, error)
+
+type LocaleExtractor func(context.Context) string
+
+type ComponentInstrumentationStage string
+
+const (
+	ComponentStageBegin ComponentInstrumentationStage = "begin"
+	ComponentStageEnd   ComponentInstrumentationStage = "end"
+)
+
+type ComponentInstrumentationEvent struct {
+	Component string
+	Stage     ComponentInstrumentationStage
+	Err       error
+	Duration  time.Duration
+}
+
+type ComponentInstrumentationHook func(context.Context, ComponentInstrumentationEvent)
+
+type ComponentAugmenter func(context.Context, string, map[string]any) error
+
+type AttrRuleOption func(*attrPolicy)
+
+type attrPolicy struct {
+	required    map[string]struct{}
+	allowed     map[string]struct{}
+	allowOthers bool
+}
+
 type Config struct {
-	fs              *embed.FS
-	funcMap         template.FuncMap
-	funcMapProvider func(context.Context) template.FuncMap
-	dataAugmenter   func(context.Context, any) any
-	cacheKeyFunc    func(context.Context, string) string
+	fs                  *embed.FS
+	funcMap             template.FuncMap
+	funcMapProvider     func(context.Context) template.FuncMap
+	dataAugmenter       func(context.Context, any) any
+	cacheKeyFunc        func(context.Context, string) string
+	finalTemplatePass   bool
+	postProcessors      []PostProcessor
+	pagePipelines       [][]PostProcessor
+	streamingWrites     bool
+	localeExtractor     LocaleExtractor
+	localeFallback      string
+	componentAugmenters map[string][]ComponentAugmenter
+	attrPolicies        map[string]attrPolicy
+	instrumentHooks     []ComponentInstrumentationHook
 }
 
 type Option func(*HC)
@@ -61,6 +101,8 @@ func NewHC(folder string, opts ...Option) *HC {
 	hc := &HC{folder: folder}
 	hc.cache.entries = make(map[string]cacheEntry)
 	hc.cache.sources = make(map[string]componentSource)
+	hc.cfg.componentAugmenters = make(map[string][]ComponentAugmenter)
+	hc.cfg.attrPolicies = make(map[string]attrPolicy)
 	for _, opt := range opts {
 		opt(hc)
 	}
@@ -106,17 +148,211 @@ func WithCacheKeyFunc(fn func(context.Context, string) string) Option {
 	}
 }
 
+func WithFinalTemplatePass() Option {
+	return func(h *HC) {
+		h.cfg.finalTemplatePass = true
+	}
+}
+
+func WithPostProcessor(proc PostProcessor) Option {
+	return func(h *HC) {
+		if proc == nil {
+			return
+		}
+		h.cfg.postProcessors = append(h.cfg.postProcessors, proc)
+	}
+}
+
+func WithPagePipeline(steps ...PostProcessor) Option {
+	return func(h *HC) {
+		filtered := make([]PostProcessor, 0, len(steps))
+		for _, step := range steps {
+			if step != nil {
+				filtered = append(filtered, step)
+			}
+		}
+		if len(filtered) == 0 {
+			return
+		}
+		h.cfg.pagePipelines = append(h.cfg.pagePipelines, filtered)
+	}
+}
+
+func WithStreamingWrites() Option {
+	return func(h *HC) {
+		h.cfg.streamingWrites = true
+	}
+}
+
+func WithLocaleCacheKeys(defaultLocale string, extractor LocaleExtractor) Option {
+	return func(h *HC) {
+		h.cfg.localeFallback = strings.TrimSpace(defaultLocale)
+		h.cfg.localeExtractor = extractor
+	}
+}
+
+func WithLocaleCacheKeysFromValue(key any, defaultLocale string) Option {
+	return WithLocaleCacheKeys(defaultLocale, func(ctx context.Context) string {
+		if ctx == nil {
+			return ""
+		}
+		if v := ctx.Value(key); v != nil {
+			if str, ok := v.(string); ok {
+				return str
+			}
+		}
+		return ""
+	})
+}
+
+func WithComponentAugmenter(component string, augmenter ComponentAugmenter) Option {
+	return func(h *HC) {
+		if augmenter == nil {
+			return
+		}
+		name := strings.TrimSpace(component)
+		if name == "" {
+			name = "*"
+		}
+		key := strings.ToLower(name)
+		if name == "*" {
+			key = "*"
+		}
+		h.cfg.componentAugmenters[key] = append(h.cfg.componentAugmenters[key], augmenter)
+	}
+}
+
+func WithAttrRules(component string, opts ...AttrRuleOption) Option {
+	return func(h *HC) {
+		name := strings.TrimSpace(component)
+		if name == "" {
+			return
+		}
+		policy := attrPolicy{
+			required: make(map[string]struct{}),
+			allowed:  make(map[string]struct{}),
+		}
+		for _, opt := range opts {
+			if opt != nil {
+				opt(&policy)
+			}
+		}
+		for key := range policy.required {
+			policy.allowed[key] = struct{}{}
+		}
+		h.cfg.attrPolicies[strings.ToLower(name)] = policy
+	}
+}
+
+func RequireAttrs(names ...string) AttrRuleOption {
+	return func(policy *attrPolicy) {
+		if policy.required == nil {
+			policy.required = make(map[string]struct{})
+		}
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			policy.required[strings.ToLower(name)] = struct{}{}
+		}
+	}
+}
+
+func AllowAttrs(names ...string) AttrRuleOption {
+	return func(policy *attrPolicy) {
+		if policy.allowed == nil {
+			policy.allowed = make(map[string]struct{})
+		}
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			policy.allowed[strings.ToLower(name)] = struct{}{}
+		}
+	}
+}
+
+func AllowOtherAttrs() AttrRuleOption {
+	return func(policy *attrPolicy) {
+		policy.allowOthers = true
+	}
+}
+
+func WithComponentInstrumentation(hook ComponentInstrumentationHook) Option {
+	return func(h *HC) {
+		if hook == nil {
+			return
+		}
+		h.cfg.instrumentHooks = append(h.cfg.instrumentHooks, hook)
+	}
+}
+
 func (h *HC) ParseFile(writer io.Writer, filename string, data any) error {
 	return h.ParseFileContext(context.Background(), writer, filename, data)
 }
 
 func (h *HC) ParseFileContext(ctx context.Context, writer io.Writer, filename string, data any) error {
-	raw, err := h.readFile(filename)
+	raw, state, err := h.prepareRenderState(ctx, filename, data)
 	if err != nil {
 		return err
 	}
+
+	canStream := h.cfg.streamingWrites && writer != nil && !h.cfg.finalTemplatePass && len(h.cfg.postProcessors) == 0 && len(h.cfg.pagePipelines) == 0
+	if canStream {
+		return h.renderStreaming(state, raw, writer)
+	}
+
+	rendered, err := h.renderMarkupBytes(state, raw, 0)
+	if err != nil {
+		return err
+	}
+
+	final, err := h.applyPostProcessing(state, rendered, h.cfg.finalTemplatePass)
+	if err != nil {
+		return err
+	}
+
+	if writer != nil {
+		_, err = writer.Write(final)
+		return err
+	}
+	return nil
+}
+
+func (h *HC) ParseFileTemplate(ctx context.Context, writer io.Writer, filename string, data any) error {
+	raw, state, err := h.prepareRenderState(ctx, filename, data)
+	if err != nil {
+		return err
+	}
+
+	rendered, err := h.renderMarkupBytes(state, raw, 0)
+	if err != nil {
+		return err
+	}
+
+	final, err := h.applyPostProcessing(state, rendered, true)
+	if err != nil {
+		return err
+	}
+
+	if writer != nil {
+		_, err = writer.Write(final)
+		return err
+	}
+	return nil
+}
+
+func (h *HC) prepareRenderState(ctx context.Context, filename string, data any) ([]byte, *renderState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	raw, err := h.readFile(filename)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(raw) == 0 {
-		return ErrEmptyFile
+		return nil, nil, ErrEmptyFile
 	}
 
 	mergedFuncs := h.mergedFuncMap(ctx)
@@ -132,16 +368,222 @@ func (h *HC) ParseFileContext(ctx context.Context, writer io.Writer, filename st
 		funcs: mergedFuncs,
 		data:  h.dataWithContext(augmented, ctx),
 	}
+	return raw, state, nil
+}
 
-	rendered, err := h.renderAll(state, raw)
+func (h *HC) renderStreaming(state *renderState, input []byte, writer io.Writer) error {
+	if writer == nil {
+		return errors.New("streaming requires a writer")
+	}
+	return h.renderMarkupStream(state, input, writer, 0)
+}
+
+func (h *HC) renderMarkupBytes(state *renderState, input []byte, depth int) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := h.renderMarkupStream(state, input, &buf, depth); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (h *HC) renderMarkupStream(state *renderState, input []byte, writer io.Writer, depth int) error {
+	decoder := xml.NewDecoder(bytes.NewReader(input))
+	decoder.Strict = false
+	decoder.AutoClose = xml.HTMLAutoClose
+
+	cursor := 0
+	for {
+		startOffset := decoder.InputOffset()
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		startElem, ok := token.(xml.StartElement)
+		if !ok || !isComponentName(startElem.Name.Local) {
+			continue
+		}
+
+		depthCount := 1
+		var endOffset int64
+		for depthCount > 0 {
+			token, err = decoder.Token()
+			if err == io.EOF {
+				return fmt.Errorf("unclosed component tag: %s", startElem.Name.Local)
+			}
+			if err != nil {
+				return err
+			}
+			switch token.(type) {
+			case xml.StartElement:
+				depthCount++
+			case xml.EndElement:
+				depthCount--
+			}
+			if depthCount == 0 {
+				endOffset = decoder.InputOffset()
+			}
+		}
+
+		start := int(startOffset)
+		end := int(endOffset)
+		if start < 0 || end > len(input) || start >= end {
+			return fmt.Errorf("invalid offsets for component %s", startElem.Name.Local)
+		}
+
+		if start > cursor {
+			if _, err := writer.Write(input[cursor:start]); err != nil {
+				return err
+			}
+		}
+
+		rendered, err := h.renderComponent(state, startElem, input[start:end], depth+1)
+		if err != nil {
+			return err
+		}
+
+		if err := h.renderMarkupStream(state, rendered, writer, depth+1); err != nil {
+			return err
+		}
+
+		cursor = end
+	}
+
+	if cursor < len(input) {
+		_, err := writer.Write(input[cursor:])
+		return err
+	}
+	return nil
+}
+
+func (h *HC) applyPostProcessing(state *renderState, input []byte, enableFinalTemplate bool) ([]byte, error) {
+	current := input
+	var err error
+
+	if enableFinalTemplate {
+		current, err = h.executeFinalTemplate(state, current)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(h.cfg.pagePipelines) > 0 {
+		for _, pipeline := range h.cfg.pagePipelines {
+			for _, step := range pipeline {
+				current, err = step(state.ctx, current, state.data, state.funcs)
+				if err != nil {
+					return nil, err
+				}
+				if current == nil {
+					current = []byte{}
+				}
+			}
+		}
+	}
+
+	if len(h.cfg.postProcessors) == 0 {
+		return current, nil
+	}
+
+	for _, proc := range h.cfg.postProcessors {
+		current, err = proc(state.ctx, current, state.data, state.funcs)
+		if err != nil {
+			return nil, err
+		}
+		if current == nil {
+			current = []byte{}
+		}
+	}
+
+	return current, nil
+}
+
+func (h *HC) emitInstrumentation(ctx context.Context, component string, stage ComponentInstrumentationStage, err error, duration time.Duration) {
+	if len(h.cfg.instrumentHooks) == 0 {
+		return
+	}
+	event := ComponentInstrumentationEvent{
+		Component: component,
+		Stage:     stage,
+		Err:       err,
+		Duration:  duration,
+	}
+	for _, hook := range h.cfg.instrumentHooks {
+		hook(ctx, event)
+	}
+}
+
+func (h *HC) executeFinalTemplate(state *renderState, input []byte) ([]byte, error) {
+	tpl := template.New("hc-final").Option("missingkey=zero")
+	if len(state.funcs) > 0 {
+		tpl = tpl.Funcs(state.funcs)
+	}
+
+	parsed, err := tpl.Parse(string(input))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if writer != nil {
-		_, err = writer.Write(rendered)
-		return err
+	var buf bytes.Buffer
+	if err := parsed.Execute(&buf, state.data); err != nil {
+		return nil, err
 	}
+	return buf.Bytes(), nil
+}
+
+func (h *HC) applyComponentAugmenters(state *renderState, component string, payload map[string]any) error {
+	if len(h.cfg.componentAugmenters) == 0 {
+		return nil
+	}
+
+	if augmenters := h.cfg.componentAugmenters["*"]; len(augmenters) > 0 {
+		for _, aug := range augmenters {
+			if err := aug(state.ctx, component, payload); err != nil {
+				return err
+			}
+		}
+	}
+
+	if augmenters := h.cfg.componentAugmenters[strings.ToLower(component)]; len(augmenters) > 0 {
+		for _, aug := range augmenters {
+			if err := aug(state.ctx, component, payload); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (h *HC) validateAttributes(component string, props map[string]any) error {
+	if len(h.cfg.attrPolicies) == 0 {
+		return nil
+	}
+
+	policy, ok := h.cfg.attrPolicies[strings.ToLower(component)]
+	if !ok {
+		return nil
+	}
+
+	for req := range policy.required {
+		if _, ok := props[req]; !ok {
+			return fmt.Errorf("component %s missing required attr %q", component, req)
+		}
+	}
+
+	if policy.allowOthers {
+		return nil
+	}
+
+	for name := range props {
+		if _, ok := policy.allowed[name]; !ok {
+			return fmt.Errorf("component %s received unsupported attr %q", component, name)
+		}
+	}
+
 	return nil
 }
 
@@ -228,14 +670,23 @@ func (h *HC) dataWithContext(data any, ctx context.Context) any {
 
 func (h *HC) cacheKey(ctx context.Context, componentName string) string {
 	base := strings.ToLower(componentName)
-	if h.cfg.cacheKeyFunc == nil {
-		return base
+	if h.cfg.cacheKeyFunc != nil {
+		if key := strings.TrimSpace(h.cfg.cacheKeyFunc(ctx, componentName)); key != "" {
+			base = key
+		}
 	}
-	key := h.cfg.cacheKeyFunc(ctx, componentName)
-	if strings.TrimSpace(key) == "" {
-		return base
+
+	if h.cfg.localeExtractor != nil {
+		locale := strings.TrimSpace(h.cfg.localeExtractor(ctx))
+		if locale == "" {
+			locale = h.cfg.localeFallback
+		}
+		if locale != "" {
+			base = strings.ToLower(locale) + ":" + base
+		}
 	}
-	return key
+
+	return base
 }
 
 func (h *HC) getComponentSource(name string) ([]byte, string, error) {
@@ -270,111 +721,38 @@ func (h *HC) readFile(name string) ([]byte, error) {
 	return os.ReadFile(name)
 }
 
-func (h *HC) renderAll(state *renderState, input []byte) ([]byte, error) {
-	current := append([]byte(nil), input...)
-	for range maxComponentPasses {
-		out, changed, err := h.replaceOnce(state, current)
-		if err != nil {
-			return nil, err
-		}
-		if !changed {
-			return out, nil
-		}
-		current = out
-	}
-	return nil, fmt.Errorf("component rendering exceeded %d passes", maxComponentPasses)
-}
+func (h *HC) renderComponent(state *renderState, elem xml.StartElement, raw []byte, depth int) ([]byte, error) {
+	component := elem.Name.Local
+	start := time.Now()
+	h.emitInstrumentation(state.ctx, component, ComponentStageBegin, nil, 0)
 
-func (h *HC) replaceOnce(state *renderState, input []byte) ([]byte, bool, error) {
-	decoder := xml.NewDecoder(bytes.NewReader(input))
-	decoder.Strict = false
-	decoder.AutoClose = xml.HTMLAutoClose
-	var replacements []componentReplacement
-	for {
-		startOffset := decoder.InputOffset()
-		token, err := decoder.Token()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, false, err
-		}
+	var execErr error
+	defer func() {
+		h.emitInstrumentation(state.ctx, component, ComponentStageEnd, execErr, time.Since(start))
+	}()
 
-		startElem, ok := token.(xml.StartElement)
-		if !ok || !isComponentName(startElem.Name.Local) {
-			continue
-		}
-		depth := 1
-		var endOffset int64
-		for depth > 0 {
-			token, err = decoder.Token()
-			if err == io.EOF {
-				return nil, false, fmt.Errorf("unclosed component tag: %s", startElem.Name.Local)
-			}
-			if err != nil {
-				return nil, false, err
-			}
-			switch token.(type) {
-			case xml.StartElement:
-				depth++
-			case xml.EndElement:
-				depth--
-			}
-			if depth == 0 {
-				endOffset = decoder.InputOffset()
-			}
-		}
-
-		start := int(startOffset)
-		end := int(endOffset)
-		if start < 0 || end > len(input) || start >= end {
-			return nil, false, fmt.Errorf("invalid offsets for component %s", startElem.Name.Local)
-		}
-
-		raw := input[start:end]
-		rendered, err := h.renderComponent(state, startElem, raw)
-		if err != nil {
-			return nil, false, err
-		}
-
-		replacements = append(replacements, componentReplacement{
-			start:    start,
-			end:      end,
-			rendered: rendered,
-		})
+	if depth > maxComponentPasses {
+		execErr = fmt.Errorf("component rendering exceeded %d passes", maxComponentPasses)
+		return nil, execErr
 	}
 
-	if len(replacements) == 0 {
-		return input, false, nil
-	}
-
-	var buf bytes.Buffer
-	cursor := 0
-	for _, repl := range replacements {
-		buf.Write(input[cursor:repl.start])
-		buf.Write(repl.rendered)
-		cursor = repl.end
-	}
-	buf.Write(input[cursor:])
-
-	return buf.Bytes(), true, nil
-}
-
-func (h *HC) renderComponent(state *renderState, elem xml.StartElement, raw []byte) ([]byte, error) {
-	tpl, err := h.loadComponentTemplate(state, elem.Name.Local)
+	tpl, err := h.loadComponentTemplate(state, component)
 	if err != nil {
+		execErr = err
 		return nil, err
 	}
 
-	children, selfClosing, err := splitComponentBody(raw, elem.Name.Local)
+	children, selfClosing, err := splitComponentBody(raw, component)
 	if err != nil {
+		execErr = err
 		return nil, err
 	}
 
 	renderedChildren := template.HTML("")
 	if len(children) > 0 {
-		childOutput, err2 := h.renderAll(state, children)
+		childOutput, err2 := h.renderMarkupBytes(state, children, depth+1)
 		if err2 != nil {
+			execErr = err2
 			return nil, err2
 		}
 		renderedChildren = template.HTML(string(childOutput))
@@ -382,6 +760,12 @@ func (h *HC) renderComponent(state *renderState, elem xml.StartElement, raw []by
 
 	props, resolved, err := h.resolveAttrs(state, elem.Attr)
 	if err != nil {
+		execErr = err
+		return nil, err
+	}
+
+	if err := h.validateAttributes(component, props); err != nil {
+		execErr = err
 		return nil, err
 	}
 
@@ -391,17 +775,24 @@ func (h *HC) renderComponent(state *renderState, elem xml.StartElement, raw []by
 		"Ctx":         state.ctx,
 		"Data":        state.data,
 		"Root":        state.data,
-		"Component":   elem.Name.Local,
+		"Component":   component,
 		"HasChildren": len(children) > 0,
 		"ChildrenRaw": string(children),
 		"Children":    renderedChildren,
 		"SelfClosing": selfClosing,
 	}
 
+	if err := h.applyComponentAugmenters(state, component, payload); err != nil {
+		execErr = err
+		return nil, err
+	}
+
 	var buf bytes.Buffer
 	if err := tpl.Execute(&buf, payload); err != nil {
-		return nil, fmt.Errorf("render component %s: %w", elem.Name.Local, err)
+		execErr = fmt.Errorf("render component %s: %w", component, err)
+		return nil, execErr
 	}
+
 	return buf.Bytes(), nil
 }
 
@@ -465,7 +856,7 @@ func (h *HC) loadComponentTemplate(state *renderState, name string) (*template.T
 		h.cache.mu.RUnlock()
 	}
 
-	content, _, err := h.getComponentSource(name)
+	content, source, err := h.getComponentSource(name)
 	if err != nil {
 		return nil, err
 	}
@@ -473,6 +864,19 @@ func (h *HC) loadComponentTemplate(state *renderState, name string) (*template.T
 	funcs := h.componentFuncMap(state.funcs)
 	tpl, err := template.New(name).Funcs(funcs).Option("missingkey=zero").Parse(string(content))
 	if err != nil {
+		if tmplErr, ok := err.(*template.Error); ok {
+			location := source
+			if location == "" {
+				location = name
+			}
+			if tmplErr.Line > 0 {
+				return nil, fmt.Errorf("parse component %s (%s:%d): %s", name, location, tmplErr.Line, tmplErr.Description)
+			}
+			return nil, fmt.Errorf("parse component %s (%s): %s", name, location, tmplErr.Description)
+		}
+		if source != "" {
+			return nil, fmt.Errorf("parse component %s (%s): %w", name, source, err)
+		}
 		return nil, fmt.Errorf("parse component %s: %w", name, err)
 	}
 
@@ -524,13 +928,6 @@ func (h *HC) readComponentFile(name string) ([]byte, string, error) {
 	}
 	// Provide a detailed error message listing every path that was checked.
 	return nil, "", fmt.Errorf("component %s not found; looked in %s", name, strings.Join(attempts, ", "))
-}
-
-// componentReplacement records which slice of the original markup is being replaced.
-type componentReplacement struct {
-	start    int
-	end      int
-	rendered []byte
 }
 
 // resolvedAttr keeps the attribute name, its lower-case key, and the evaluated value.
