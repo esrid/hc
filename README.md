@@ -51,13 +51,71 @@ func PageHandler(w http.ResponseWriter, r *http.Request) {
 - `NewHC(folder string, opts ...Option)` initialises the engine and memoizes compiled component templates keyed by lowercase component names. Reuse the same instance across requests; the cache is concurrency-safe.
 - `WithFS(embed.FS)` lets you serve templates out of `//go:embed` bundles. Without it, files are read from disk relative to `folder`.
 - `WithFuncMap(template.FuncMap)` merges additional helpers into both the component templates and attribute evaluator. Helpers can be consumed inside component files (`{{ upper .Props.text }}`) or attribute expressions (`text="{{ upper .Primary }}"`).
+- `WithFuncMapProvider(func(context.Context) template.FuncMap)` supplies request-scoped helpers (translations, authorization checks, etc.). The provider is invoked once per render and merged with the static func map.
+- `WithDataAugmenter(func(context.Context, any) any)` lets you layer default fields onto the data model once per render (for example, injecting `.User` based on the request context).
+- `WithCacheKeyFunc(func(context.Context, string) string)` customises the component cache key so you can reuse compiled templates per locale or feature flag while keeping the shared renderer.
 - `ParseFile(writer io.Writer, filename string, data any) error` loads the top-level template, resolves every component in up to 16 passes, and writes the final markup to `writer`. Pass `nil` as the writer if you only need to check for errors (no buffer will be returned).
+- `ParseFileContext(ctx context.Context, writer io.Writer, filename string, data any) error` behaves like `ParseFile` but lets you pass the active request context. The renderer forwards this context to helpers created by `WithFuncMapProvider`.
+
+```go
+components := hc.NewHC("web/components",
+  hc.WithFuncMapProvider(func(ctx context.Context) template.FuncMap {
+    user := ctx.Value(userKey{}) // grab user off the request context
+    return template.FuncMap{
+      "T": func(key string) string {
+        return translations.Lookup(ctx, key)
+      },
+      "User": func() any { return user },
+    }
+  }),
+  hc.WithDataAugmenter(func(ctx context.Context, data any) any {
+    base := map[string]any{"User": ctx.Value(userKey{})}
+    if src, ok := data.(map[string]any); ok {
+      merged := make(map[string]any, len(src)+len(base))
+      for k, v := range src {
+        merged[k] = v
+      }
+      for k, v := range base {
+        merged[k] = v
+      }
+      return merged
+    }
+    return base
+  }),
+)
+```
+
+For localisation-friendly helpers, reach for the optional add-on under `hcx/i18n`. It inspects `Accept-Language`, loads locale bundles, and installs a ready-made `T` helper:
+
+```go
+engine := hc.NewHC("web/components",
+  i18n.Provider(i18n.Options{
+    Loader: func(ctx context.Context, locale string) (i18n.Translator, error) {
+      return bundles.Load(locale), nil
+    },
+    DefaultLocale:    "en",
+    SupportedLocales: []string{"en", "fr"},
+  }),
+  hc.WithCacheKeyFunc(func(ctx context.Context, name string) string {
+    header := i18n.AcceptLanguageFromContext(ctx)
+    if header == "" {
+      return strings.ToLower(name)
+    }
+    return header + ":" + strings.ToLower(name)
+  }),
+)
+```
+
+Use `i18n.WithAcceptLanguage(ctx, header)` in your HTTP handlers to pass the request header into the renderer.
+
+When the root `data` is a `map[string]…`, the renderer clones it and injects a `Ctx` entry pointing at the supplied context so attribute expressions can call `{{ .Ctx }}` without additional wiring.
 
 Attribute values run through Go's `text/template` with the same func map, so props can reference fields from `data` or call helper functions. Inside component templates you have access to:
 
 - `.Props` and `.Attrs` for resolved attributes (`.Attrs` keeps original casing so `forwardAttrs` can re-emit them).
 - `.Children` for rendered nested markup (empty for self-closing components).
-- `.Ctx` for the entire data object passed to `ParseFile`.
+- `.Ctx` for the `context.Context` supplied to `ParseFileContext` (`context.Background()` when using `ParseFile`).
+- `.Data` (alias `.Root`) for the root data object passed to `ParseFile`.
 
 ## Rendering Outside HTTP
 
